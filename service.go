@@ -30,6 +30,15 @@ type Config struct {
 	// Txt records
 	Text map[string]string
 
+	// TextOrder lists keys of Text in the order they appear in the TXT
+	// record; keys not listed follow, sorted. Some conventions want a key
+	// first, like Bonjour Printing's txtvers.
+	TextOrder []string
+
+	// Subtypes of the service type, without "._sub", like "_universal" for
+	// "_universal._sub._ipp._tcp" (RFC 6763 section 7.1).
+	Subtypes []string
+
 	// IP addresses of the service.
 	// This field is deprecated and should not be used.
 	IPs []net.IP
@@ -43,14 +52,16 @@ type Config struct {
 
 func (c Config) Copy() Config {
 	return Config{
-		Name:   c.Name,
-		Type:   c.Type,
-		Domain: c.Domain,
-		Host:   c.Host,
-		Text:   c.Text,
-		IPs:    c.IPs,
-		Port:   c.Port,
-		Ifaces: c.Ifaces,
+		Name:      c.Name,
+		Type:      c.Type,
+		Domain:    c.Domain,
+		Host:      c.Host,
+		Text:      c.Text,
+		TextOrder: c.TextOrder,
+		Subtypes:  c.Subtypes,
+		IPs:       c.IPs,
+		Port:      c.Port,
+		Ifaces:    c.Ifaces,
 	}
 }
 
@@ -99,15 +110,17 @@ func validHostname(host string) string {
 
 // Service represents a DNS-SD service instance
 type Service struct {
-	Name   string
-	Type   string
-	Domain string
-	Host   string
-	Text   map[string]string
-	TTL    time.Duration // Original time to live
-	Port   int
-	IPs    []net.IP
-	Ifaces []string
+	Name      string
+	Type      string
+	Domain    string
+	Host      string
+	Text      map[string]string
+	TextOrder []string
+	Subtypes  []string
+	TTL       time.Duration // Original time to live
+	Port      int
+	IPs       []net.IP
+	Ifaces    []string
 
 	// stores ips by interface name for caching purposes
 	ifaceIPs   map[string][]net.IP
@@ -133,6 +146,13 @@ func NewService(cfg Config) (s Service, err error) {
 	if port == 0 {
 		err = fmt.Errorf("invalid port \"%d\"", port)
 		return
+	}
+
+	for _, sub := range cfg.Subtypes {
+		if len(sub) < 2 || sub[0] != '_' || strings.ContainsAny(sub, ". ") {
+			err = fmt.Errorf("invalid subtype \"%s\"", sub)
+			return
+		}
 	}
 
 	domain := cfg.Domain
@@ -162,15 +182,17 @@ func NewService(cfg Config) (s Service, err error) {
 	}
 
 	return Service{
-		Name:     trimServiceNameSuffixRight(name),
-		Type:     typ,
-		Domain:   domain,
-		Host:     validHostname(host),
-		Text:     text,
-		Port:     port,
-		IPs:      ips,
-		Ifaces:   ifaces,
-		ifaceIPs: map[string][]net.IP{},
+		Name:      trimServiceNameSuffixRight(name),
+		Type:      typ,
+		Domain:    domain,
+		Host:      validHostname(host),
+		Text:      text,
+		TextOrder: cfg.TextOrder,
+		Subtypes:  cfg.Subtypes,
+		Port:      port,
+		IPs:       ips,
+		Ifaces:    ifaces,
+		ifaceIPs:  map[string][]net.IP{},
 	}, nil
 }
 
@@ -261,6 +283,8 @@ func (s Service) Copy() *Service {
 		Domain:     s.Domain,
 		Host:       s.Host,
 		Text:       s.Text,
+		TextOrder:  s.TextOrder,
+		Subtypes:   s.Subtypes,
 		TTL:        s.TTL,
 		IPs:        s.IPs,
 		Port:       s.Port,
@@ -347,6 +371,16 @@ func (s Service) EscapedServiceInstanceName() string {
 // (Note the trailing dot.)
 func (s Service) ServiceInstanceName() string {
 	return fmt.Sprintf("%s.%s.%s.", s.Name, s.Type, s.Domain)
+}
+
+// SubtypeNames returns the names of the service's subtypes, like
+// "_universal._sub._ipp._tcp.local.".
+func (s Service) SubtypeNames() []string {
+	names := make([]string, len(s.Subtypes))
+	for i, sub := range s.Subtypes {
+		names[i] = fmt.Sprintf("%s._sub.%s", sub, s.ServiceName())
+	}
+	return names
 }
 
 // ServiceName returns the service name in the

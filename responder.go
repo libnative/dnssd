@@ -146,6 +146,7 @@ func (r *responder) announceAtInterface(service *Service, iface *net.Interface) 
 	var answer []dns.RR
 	answer = append(answer, SRV(*service))
 	answer = append(answer, PTR(*service))
+	answer = append(answer, SubtypePTRs(*service)...)
 	answer = append(answer, TXT(*service))
 	for _, a := range A(*service, iface) {
 		answer = append(answer, a)
@@ -280,18 +281,16 @@ func (r *responder) unannounce(services []*Service) {
 	// collect records per interface
 	rrsByIfaceName := map[string][]dns.RR{}
 	for _, srv := range services {
-		rr := PTR(*srv)
-		rr.Header().Ttl = 0
+		goodbye := append([]dns.RR{PTR(*srv)}, SubtypePTRs(*srv)...)
+		for _, rr := range goodbye {
+			rr.Header().Ttl = 0
+		}
 		for _, iface := range srv.Interfaces() {
 			ips := srv.IPsAtInterface(iface)
 			if len(ips) == 0 {
 				continue
 			}
-			if rrs, ok := rrsByIfaceName[iface.Name]; ok {
-				rrsByIfaceName[iface.Name] = append(rrs, rr)
-			} else {
-				rrsByIfaceName[iface.Name] = []dns.RR{rr}
-			}
+			rrsByIfaceName[iface.Name] = append(rrsByIfaceName[iface.Name], goodbye...)
 		}
 	}
 
@@ -409,6 +408,33 @@ func (r *responder) handleQuestion(q dns.Question, req *Request, srv Service) *d
 		log.Debug.Println("Shared record response wait", delay)
 		time.Sleep(delay)
 
+	case subtypeQuestion(q.Name, srv):
+		// A browse for a subtype: answered as for the service type, with
+		// the subtype's PTR.
+		var ptr dns.RR
+		for _, rr := range SubtypePTRs(srv) {
+			if strings.EqualFold(rr.Header().Name, q.Name) {
+				ptr = rr
+			}
+		}
+		resp.Answer = []dns.RR{ptr}
+
+		extra := []dns.RR{SRV(srv), TXT(srv)}
+		for _, a := range A(srv, req.iface) {
+			extra = append(extra, a)
+		}
+		for _, aaaa := range AAAA(srv, req.iface) {
+			extra = append(extra, aaaa)
+		}
+		if nsec := NSEC(ptr, srv, req.iface); nsec != nil {
+			extra = append(extra, nsec)
+		}
+		resp.Extra = extra
+
+		// Wait 20-125 msec for shared resource responses
+		delay := time.Duration(r.random.Intn(105)+20) * time.Millisecond
+		time.Sleep(delay)
+
 	case strings.ToLower(srv.EscapedServiceInstanceName()):
 		resp.Answer = []dns.RR{SRV(srv), TXT(srv), PTR(srv)}
 
@@ -473,6 +499,18 @@ func (r *responder) handleQuestion(q dns.Question, req *Request, srv Service) *d
 	resp.Authoritative = true
 
 	return resp
+}
+
+// subtypeQuestion returns name, lower case, if it is one of the service's
+// subtypes, for handleQuestion's switch; otherwise a string no question
+// name equals.
+func subtypeQuestion(name string, srv Service) string {
+	for _, sub := range srv.SubtypeNames() {
+		if strings.EqualFold(sub, name) {
+			return strings.ToLower(name)
+		}
+	}
+	return "\x00"
 }
 
 func findConflicts(req *Request, hs []*serviceHandle) []*serviceHandle {

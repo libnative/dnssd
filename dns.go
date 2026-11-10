@@ -22,6 +22,24 @@ func PTR(srv Service) *dns.PTR {
 	}
 }
 
+// SubtypePTRs returns the PTR records for the service's subtypes, which
+// point at the service instance as its PTR does (RFC 6763 section 7.1).
+func SubtypePTRs(srv Service) []dns.RR {
+	var rrs []dns.RR
+	for _, name := range srv.SubtypeNames() {
+		rrs = append(rrs, &dns.PTR{
+			Hdr: dns.RR_Header{
+				Name:   name,
+				Rrtype: dns.TypePTR,
+				Class:  dns.ClassINET,
+				Ttl:    TTLDefault,
+			},
+			Ptr: srv.EscapedServiceInstanceName(),
+		})
+	}
+	return rrs
+}
+
 func DNSSDServicesPTR(srv Service) *dns.PTR {
 	return &dns.PTR{
 		Hdr: dns.RR_Header{
@@ -52,11 +70,23 @@ func SRV(srv Service) *dns.SRV {
 
 // TXT returns the TXT record for the service.
 func TXT(srv Service) *dns.TXT {
+	// Keys in TextOrder first, in that order, then the rest, sorted.
 	keys := []string{}
-	for key := range srv.Text {
-		keys = append(keys, key)
+	listed := map[string]bool{}
+	for _, key := range srv.TextOrder {
+		if _, ok := srv.Text[key]; ok && !listed[key] {
+			keys = append(keys, key)
+			listed[key] = true
+		}
 	}
-	sort.Strings(keys)
+	rest := []string{}
+	for key := range srv.Text {
+		if !listed[key] {
+			rest = append(rest, key)
+		}
+	}
+	sort.Strings(rest)
+	keys = append(keys, rest...)
 
 	txts := []string{}
 	for _, k := range keys {
