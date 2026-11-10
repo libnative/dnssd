@@ -1,6 +1,6 @@
 # DNS-SD
 
-> **libnative fork.** This is [brutella/dnssd](https://github.com/brutella/dnssd) v1.2.14 with two additions, used by [libnative/print](https://github.com/libnative/print) to advertise AirPrint printers: `Config.Subtypes`, service subtypes such as `_universal` for `_universal._sub._ipp._tcp` (RFC 6763 section 7.1), answered, announced and said goodbye to like the service's own PTR record; and `Config.TextOrder`, keys of `Text` to put first in the TXT record, in that order (Bonjour Printing's `txtvers`). Releases are tagged `v1.2.14-libnative.N`. The module path stays `github.com/brutella/dnssd`; use it with a `replace` directive.
+> **libnative fork.** This is [brutella/dnssd](https://github.com/brutella/dnssd) v1.2.14 with two additions, used by [libnative/print](https://github.com/libnative/print) to advertise AirPrint printers: `Config.Subtypes`, service subtypes such as `_universal` for `_universal._sub._ipp._tcp` (RFC 6763 section 7.1), answered, announced and said goodbye to like the service's own PTR record; and `Config.TextOrder`, keys of `Text` to put first in the TXT record, in that order (Bonjour Printing's `txtvers`). Changes are on the `libnative` branch, which modules pin by commit (a pseudo-version). The module path stays `github.com/brutella/dnssd`; use it with a `replace` directive.
 
 [![Build Status](https://travis-ci.org/brutella/hc.svg)](https://travis-ci.org/brutella/dnssd)
 
