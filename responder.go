@@ -68,34 +68,50 @@ func newResponder(conn MDNSConn) *responder {
 
 func (r *responder) Remove(h ServiceHandle) {
 	r.mutex.Lock()
-	defer r.mutex.Unlock()
+	var gone *Service
 	for i, s := range r.managed {
 		if h == s {
-			handle := h.(*serviceHandle)
-			r.unannounce([]*Service{handle.service})
+			gone = h.(*serviceHandle).service
 			r.managed = append(r.managed[:i], r.managed[i+1:]...)
-			return
+			break
 		}
+	}
+	r.mutex.Unlock()
+	// The goodbye takes a while (it is sent twice on each interface), and
+	// queries are answered meanwhile.
+	if gone != nil {
+		r.unannounce([]*Service{gone})
 	}
 }
 
 func (r *responder) Add(srv Service) (ServiceHandle, error) {
 	r.mutex.Lock()
-	defer r.mutex.Unlock()
+	if !r.isRunning {
+		defer r.mutex.Unlock()
+		return r.addUnmanaged(srv), nil
+	}
+	r.mutex.Unlock()
 
-	if r.isRunning {
-		ctx, cancel := context.WithCancel(context.TODO())
-		defer cancel()
-
-		srv, err := r.register(ctx, srv)
-		if err != nil {
-			return nil, err
-		}
-
-		return r.addManaged(srv), nil
+	// Probing takes a second or more, on a connection of its own, and the
+	// responder answers queries meanwhile.
+	log.Debug.Printf("Probing for host %s and service %s…\n", srv.Hostname(), srv.ServiceInstanceName())
+	probed, err := ProbeService(context.TODO(), srv)
+	if err != nil {
+		return nil, err
 	}
 
-	return r.addUnmanaged(srv), nil
+	r.mutex.Lock()
+	if !r.isRunning {
+		// Stopped while probing: its goodbye did not include this service,
+		// so it must not be announced now.
+		r.mutex.Unlock()
+		return nil, fmt.Errorf("responder stopped while probing %s", srv.ServiceInstanceName())
+	}
+	h := r.addManaged(probed)
+	srvs := services(r.managed)
+	r.mutex.Unlock()
+	go r.announce(srvs)
+	return h, nil
 }
 
 func (r *responder) Respond(ctx context.Context) error {
@@ -195,13 +211,13 @@ func (r *responder) register(ctx context.Context, srv Service) (Service, error) 
 }
 
 func (r *responder) addManaged(srv Service) ServiceHandle {
-	h := &serviceHandle{&srv}
+	h := &serviceHandle{mu: r.mutex, service: &srv}
 	r.managed = append(r.managed, h)
 	return h
 }
 
 func (r *responder) addUnmanaged(srv Service) ServiceHandle {
-	h := &serviceHandle{&srv}
+	h := &serviceHandle{mu: r.mutex, service: &srv}
 	r.unmanaged = append(r.unmanaged, h)
 	return h
 }
@@ -219,29 +235,52 @@ func (r *responder) respond(ctx context.Context) error {
 		select {
 		case req := <-ch:
 			r.mutex.Lock()
-			r.handleRequest(req)
+			responses, delay := r.handleRequest(req)
 			r.mutex.Unlock()
+			r.send(responses, delay)
 
 		case <-ctx.Done():
-			r.unannounce(services(r.managed))
-			r.conn.Close()
+			r.mutex.Lock()
 			r.isRunning = false
+			gone := services(r.managed)
+			r.mutex.Unlock()
+			r.unannounce(gone)
+			r.conn.Close()
 			return ctx.Err()
 		}
 	}
 }
 
-func (r *responder) handleRequest(req *Request) {
+// send sends responses after delay, which a response with shared records
+// waits (RFC 6762 section 6), once for all of them.
+func (r *responder) send(responses []*Response, delay time.Duration) {
+	if len(responses) == 0 {
+		return
+	}
+	if delay > 0 {
+		log.Debug.Println("Shared record response wait", delay)
+		time.Sleep(delay)
+	}
+	for _, resp := range responses {
+		if err := r.conn.SendResponse(resp); err != nil {
+			log.Debug.Println(err)
+		}
+	}
+}
+
+// handleRequest returns the responses to a request, and how long they
+// wait: 20-125 ms if any holds shared records. r.mutex is held.
+func (r *responder) handleRequest(req *Request) ([]*Response, time.Duration) {
 	if len(r.managed) == 0 {
 		// Ignore requests when no services are managed
-		return
+		return nil, 0
 	}
 
 	// If messages is truncated, we wait for the next message to come (RFC6762 18.5)
 	if req.msg.Truncated {
 		r.truncated = req
 		log.Debug.Println("Waiting for additional answers...")
-		return
+		return nil, 0
 	}
 
 	// append request
@@ -253,7 +292,7 @@ func (r *responder) handleRequest(req *Request) {
 	}
 
 	if len(req.msg.Question) > 0 {
-		r.handleQuery(req, services(r.managed))
+		return r.handleQuery(req, services(r.managed))
 	} else {
 		// Check if the request contains any conflicting records.
 		conflicts := findConflicts(req, r.managed)
@@ -269,6 +308,7 @@ func (r *responder) handleRequest(req *Request) {
 			}
 		}
 	}
+	return nil, 0
 }
 
 func (r *responder) unannounce(services []*Service) {
@@ -319,7 +359,9 @@ func (r *responder) unannounce(services []*Service) {
 	}
 }
 
-func (r *responder) handleQuery(req *Request, services []*Service) {
+func (r *responder) handleQuery(req *Request, services []*Service) ([]*Response, time.Duration) {
+	var responses []*Response
+	shared := false
 	for _, q := range req.msg.Question {
 		msgs := []*dns.Msg{}
 		for _, srv := range services {
@@ -347,34 +389,43 @@ func (r *responder) handleQuery(req *Request, services []*Service) {
 			log.Debug.Println("No answers")
 			continue
 		}
-
-		if isUnicastQuestion(q) || isLegacyUnicastSource(req.from) {
-			resp := &Response{msg: msg, addr: req.from, iface: req.iface}
-			log.Debug.Printf("Send unicast response\n%v to %v\n", msg, resp.addr)
-			if err := r.conn.SendResponse(resp); err != nil {
-				log.Debug.Println(err)
-			}
-		} else {
-			resp := &Response{msg: msg, iface: req.iface}
-			log.Debug.Printf("Send multicast response\n%v\n", msg)
-			if err := r.conn.SendResponse(resp); err != nil {
-				log.Debug.Println(err)
+		// PTR records are shared: responses with them wait, so that
+		// several responders' answers spread out (RFC 6762 section 6).
+		for _, rr := range msg.Answer {
+			if _, ok := rr.(*dns.PTR); ok {
+				shared = true
 			}
 		}
+
+		if isUnicastQuestion(q) || isLegacyUnicastSource(req.from) {
+			log.Debug.Printf("Send unicast response\n%v to %v\n", msg, req.from)
+			responses = append(responses, &Response{msg: msg, addr: req.from, iface: req.iface})
+		} else {
+			log.Debug.Printf("Send multicast response\n%v\n", msg)
+			responses = append(responses, &Response{msg: msg, iface: req.iface})
+		}
 	}
+	var delay time.Duration
+	if shared {
+		delay = time.Duration(r.random.Intn(105)+20) * time.Millisecond
+	}
+	return responses, delay
 }
 
 func (r *responder) reprobe(h *serviceHandle) {
 	ctx, cancel := context.WithCancel(context.TODO())
 	defer cancel()
 
-	probed, err := ReprobeService(ctx, *h.service)
+	r.mutex.Lock()
+	current := *h.service
+	r.mutex.Unlock()
+	probed, err := ReprobeService(ctx, current)
 	if err != nil {
 		return
 	}
-	h.service = &probed
 
 	r.mutex.Lock()
+	h.service = &probed
 	managed := append(r.managed, h)
 	r.managed = managed
 	r.mutex.Unlock()
@@ -406,11 +457,6 @@ func (r *responder) handleQuestion(q dns.Question, req *Request, srv Service) *d
 
 		resp.Extra = extra
 
-		// Wait 20-125 msec for shared resource responses
-		delay := time.Duration(r.random.Intn(105)+20) * time.Millisecond
-		log.Debug.Println("Shared record response wait", delay)
-		time.Sleep(delay)
-
 	case subtypeQuestion(q.Name, srv):
 		// A browse for a subtype: answered as for the service type, with
 		// the subtype's PTR.
@@ -433,10 +479,6 @@ func (r *responder) handleQuestion(q dns.Question, req *Request, srv Service) *d
 			extra = append(extra, nsec)
 		}
 		resp.Extra = extra
-
-		// Wait 20-125 msec for shared resource responses
-		delay := time.Duration(r.random.Intn(105)+20) * time.Millisecond
-		time.Sleep(delay)
 
 	case strings.ToLower(srv.EscapedServiceInstanceName()):
 		resp.Answer = []dns.RR{SRV(srv), TXT(srv), PTR(srv)}
