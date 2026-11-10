@@ -281,7 +281,10 @@ func (r *responder) unannounce(services []*Service) {
 	// collect records per interface
 	rrsByIfaceName := map[string][]dns.RR{}
 	for _, srv := range services {
+		// Every record of the service, so caches drop its SRV and TXT records
+		// as well as the PTR records that list it (RFC 6762 section 10.1).
 		goodbye := append([]dns.RR{PTR(*srv)}, SubtypePTRs(*srv)...)
+		goodbye = append(goodbye, SRV(*srv), TXT(*srv))
 		for _, rr := range goodbye {
 			rr.Header().Ttl = 0
 		}

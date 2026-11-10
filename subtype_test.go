@@ -72,3 +72,38 @@ func TestTextOrder(t *testing.T) {
 		t.Fatalf("TXT = %v, want %v", got, want)
 	}
 }
+
+// goodbyeConn records the responses a responder sends.
+type goodbyeConn struct {
+	MDNSConn
+	sent []*Response
+}
+
+func (c *goodbyeConn) SendResponse(resp *Response) error {
+	c.sent = append(c.sent, resp)
+	return nil
+}
+
+func TestGoodbyeWithdrawsEveryRecord(t *testing.T) {
+	srv, err := NewService(Config{Name: "Printer", Type: "_ipp._tcp", Port: 631, Host: "gateway",
+		IPs: []net.IP{net.ParseIP("192.0.2.1")}, Ifaces: []string{"lo"}, Subtypes: []string{"_universal"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &goodbyeConn{}
+	r := &responder{conn: conn}
+	r.unannounce([]*Service{&srv})
+	if len(conn.sent) == 0 {
+		t.Skip("no loopback interface to say goodbye on")
+	}
+	types := map[uint16]int{}
+	for _, rr := range conn.sent[0].msg.Answer {
+		if rr.Header().Ttl != 0 {
+			t.Fatalf("goodbye record with TTL %d: %v", rr.Header().Ttl, rr)
+		}
+		types[rr.Header().Rrtype]++
+	}
+	if types[dns.TypePTR] != 2 || types[dns.TypeSRV] != 1 || types[dns.TypeTXT] != 1 {
+		t.Fatalf("goodbye records by type = %v, want 2 PTR (the type and the subtype), SRV and TXT", types)
+	}
+}
